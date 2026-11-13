@@ -942,6 +942,15 @@ if features['wasapi']
                      'audio/out/ao_wasapi_utils.c')
 endif
 
+wasapi_spatial = false
+if features['wasapi'] and features['win32-desktop']
+    wasapi_spatial = cc.has_header_symbol(
+        'spatialaudioclient.h', 'ISpatialAudioClient', required: false)
+endif
+features += {'wasapi-spatial': wasapi_spatial}
+if features['wasapi-spatial']
+    sources += files('audio/out/ao_wasapi_spatial.c')
+endif
 # ao_asio includes Steinberg's ASIO SDK headers under the GPLv3 half of the
 # SDK's dual licence, so it is a GPL-only file like ao_jack. Point -Dasio-sdk
 # at the SDK root (the directory holding common/asio.h): only the headers are
