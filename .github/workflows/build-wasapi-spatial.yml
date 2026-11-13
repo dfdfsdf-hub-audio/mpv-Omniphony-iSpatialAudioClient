@@ -57,41 +57,43 @@ jobs:
           meson wrap install zlib
 
       - name: Locate Visual Studio
-$programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
-$vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+        shell: pwsh
+        run: |
+          $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
 
-if (!(Test-Path $vswhere)) {
-    throw "vswhere.exe not found: $vswhere"
-}
+          if (!(Test-Path $vswhere)) {
+              throw "vswhere.exe not found: $vswhere"
+          }
 
-Write-Host "Searching for Visual Studio with MSVC x64 tools..."
+          Write-Host "Searching for Visual Studio with MSVC x64 tools..."
 
-$vsPath = & $vswhere `
-    -latest `
-    -products '*' `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-    -property installationPath
+          $vsPath = & $vswhere `
+              -latest `
+              -products '*' `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
 
-if ($LASTEXITCODE -ne 0 -or !$vsPath -or !(Test-Path $vsPath)) {
-    throw "Visual Studio with MSVC x64 C++ tools was not found."
-}
+          if ($LASTEXITCODE -ne 0 -or !$vsPath -or !(Test-Path $vsPath)) {
+              throw "Visual Studio with MSVC x64 C++ tools was not found."
+          }
 
-$vsPath = $vsPath.Trim()
+          $vsPath = $vsPath.Trim()
 
-$devShell = Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          $devShell = Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
 
-if (!(Test-Path $devShell)) {
-    throw "Visual Studio DevShell not found: $devShell"
-}
+          if (!(Test-Path $devShell)) {
+              throw "Visual Studio DevShell not found: $devShell"
+          }
 
-Write-Host "========================================"
-Write-Host "Visual Studio found:"
-Write-Host $vsPath
-Write-Host "DevShell:"
-Write-Host $devShell
-Write-Host "========================================"
+          Write-Host "========================================"
+          Write-Host "Visual Studio found:"
+          Write-Host $vsPath
+          Write-Host "DevShell:"
+          Write-Host $devShell
+          Write-Host "========================================"
 
-"VS=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VS=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build mpv with WASAPI Spatial Audio
         id: build
