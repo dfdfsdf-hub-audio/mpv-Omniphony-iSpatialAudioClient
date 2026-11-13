@@ -10,26 +10,40 @@ if (-not (Test-Path $subprojects)) {
 # Wrap shaderc to run git-sync-deps and patch unsupported generator expression
 if (-not (Test-Path "$subprojects/shaderc_cmake")) {
     git clone https://github.com/google/shaderc --depth 1 $subprojects/shaderc_cmake
-    Set-Content -Path "$subprojects/shaderc_cmake/p.diff" -Value @'
-diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
-index d44f62a..54d4719 100644
---- a/third_party/CMakeLists.txt
-+++ b/third_party/CMakeLists.txt
-@@ -87,7 +87,11 @@ if (NOT TARGET glslang)
-       # Glslang tests are off by default. Turn them on if testing Shaderc.
-       set(GLSLANG_TESTS ON)
-     endif()
--    set(GLSLANG_ENABLE_INSTALL $<NOT:${SKIP_GLSLANG_INSTALL}>)
-+    if (SKIP_GLSLANG_INSTALL)
-+      set(GLSLANG_ENABLE_INSTALL OFF)
-+    else()
-+      set(GLSLANG_ENABLE_INSTALL ON)
-+    endif()
-     add_subdirectory(${SHADERC_GLSLANG_DIR} glslang)
-   endif()
-   if (NOT TARGET glslang)
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to clone shaderc."
+    }
+
+    $shadercCMake = "$subprojects/shaderc_cmake/third_party/CMakeLists.txt"
+
+    if (!(Test-Path $shadercCMake)) {
+        throw "shaderc third_party/CMakeLists.txt not found."
+    }
+
+    $cmakeContent = Get-Content $shadercCMake -Raw
+
+    $oldCode = 'set(GLSLANG_ENABLE_INSTALL $<NOT:${SKIP_GLSLANG_INSTALL}>)'
+
+    $newCode = @'
+if (SKIP_GLSLANG_INSTALL)
+  set(GLSLANG_ENABLE_INSTALL OFF)
+else()
+  set(GLSLANG_ENABLE_INSTALL ON)
+endif()
 '@
-    git -C $subprojects/shaderc_cmake apply --ignore-whitespace p.diff
+
+    if ($cmakeContent.Contains($oldCode)) {
+        $cmakeContent = $cmakeContent.Replace($oldCode, $newCode)
+        Set-Content -Path $shadercCMake -Value $cmakeContent -NoNewline
+        Write-Host "Successfully patched shaderc CMakeLists.txt."
+    }
+    elseif ($cmakeContent.Contains('if (SKIP_GLSLANG_INSTALL)')) {
+        Write-Host "shaderc patch already applied."
+    }
+    else {
+        throw "Unable to locate GLSLANG_ENABLE_INSTALL expression in shaderc."
+    }
 }
 if (-not (Test-Path "$subprojects/shaderc")) {
     New-Item -Path "$subprojects/shaderc" -ItemType Directory | Out-Null
