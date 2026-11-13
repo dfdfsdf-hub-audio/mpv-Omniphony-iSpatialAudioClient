@@ -3,11 +3,15 @@ $PSNativeCommandUseErrorActionPreference = $true
 Set-StrictMode -Version Latest
 
 $subprojects = "subprojects"
+
 if (-not (Test-Path $subprojects)) {
     New-Item -Path $subprojects -ItemType Directory | Out-Null
 }
 
-# Wrap shaderc to run git-sync-deps and patch unsupported generator expression
+# ============================================================
+# 1. Shaderc wrapper
+# ============================================================
+
 if (-not (Test-Path "$subprojects/shaderc_cmake")) {
     git clone https://github.com/google/shaderc --depth 1 $subprojects/shaderc_cmake
 
@@ -45,9 +49,11 @@ endif()
         throw "Unable to locate GLSLANG_ENABLE_INSTALL expression in shaderc."
     }
 }
+
 if (-not (Test-Path "$subprojects/shaderc")) {
     New-Item -Path "$subprojects/shaderc" -ItemType Directory | Out-Null
 }
+
 Set-Content -Path "$subprojects/shaderc/meson.build" -Value @"
 project('shaderc', 'cpp', version: '2024.1')
 
@@ -75,11 +81,14 @@ shaderc_dep = declare_dependency(dependencies: [
 meson.override_dependency('shaderc', shaderc_dep)
 "@
 
-# Manually wrap spirv-cross for CMAKE_MSVC_RUNTIME_LIBRARY option
-# This also allows us to link statically
+# ============================================================
+# 2. SPIRV-Cross wrapper
+# ============================================================
+
 if (-not (Test-Path "$subprojects/spirv-cross-c-shared")) {
     New-Item -Path "$subprojects/spirv-cross-c-shared" -ItemType Directory | Out-Null
 }
+
 Set-Content -Path "$subprojects/spirv-cross-c-shared/meson.build" -Value @"
 project('spirv-cross', 'cpp', version: '0.59.0')
 cmake = import('cmake')
@@ -105,10 +114,14 @@ spirv_cross_c_dep = declare_dependency(dependencies: [
 meson.override_dependency('spirv-cross-c-shared', spirv_cross_c_dep)
 "@
 
-# Manually wrap Vulkan-Loader for UPDATE_DEPS option
+# ============================================================
+# 3. Vulkan Loader wrapper
+# ============================================================
+
 if (-not (Test-Path "$subprojects/vulkan")) {
     New-Item -Path "$subprojects/vulkan" -ItemType Directory | Out-Null
 }
+
 Set-Content -Path "$subprojects/vulkan/meson.build" -Value @"
 project('vulkan', 'cpp', version: '1.3.285')
 cmake = import('cmake')
@@ -123,10 +136,14 @@ vulkan_dep = vulkan_proj.dependency('vulkan')
 meson.override_dependency('vulkan', vulkan_dep)
 "@
 
-# Manually wrap libjxl for CMAKE_MSVC_RUNTIME_LIBRARY option
+# ============================================================
+# 4. libjxl wrapper
+# ============================================================
+
 if (-not (Test-Path "$subprojects/libjxl")) {
     New-Item -Path "$subprojects/libjxl" -ItemType Directory | Out-Null
 }
+
 Set-Content -Path "$subprojects/libjxl/meson.build" -Value @"
 project('libjxl', 'cpp', version: '0.12.0')
 cmake = import('cmake')
@@ -151,9 +168,14 @@ libjxl_threads_dep = libjxl_proj.dependency('jxl_threads')
 meson.override_dependency('libjxl_threads', libjxl_threads_dep)
 "@
 
+# ============================================================
+# 5. AOM wrapper
+# ============================================================
+
 if (-not (Test-Path "$subprojects/aom")) {
     New-Item -Path "$subprojects/aom" -ItemType Directory | Out-Null
 }
+
 Set-Content -Path "$subprojects/aom/meson.build" -Value @"
 project('aom', 'cpp', version: '3.13.1')
 cmake = import('cmake')
@@ -167,6 +189,10 @@ aom_proj = cmake.subproject('aom-cmake', options: opts)
 aom_dep = aom_proj.dependency('aom')
 meson.override_dependency('aom', aom_dep)
 "@
+
+# ============================================================
+# 6. Dependency Wrap configurations
+# ============================================================
 
 $projects = @(
     @{
@@ -228,15 +254,24 @@ revision = $($project.Revision)
 depth = 1
 clone-recursive = true
 "@
+
     if ($project.ContainsKey('Method')) {
         $content += "`nmethod = $($project.Method)"
     }
+
     if ($project.ContainsKey('Provides')) {
         $provide = "[provide]`n$($project.Provides -join "`n")"
         $content += "`n$provide"
     }
+
     Set-Content -Path $project.Path -Value $content
 }
+
+# ============================================================
+# 7. Meson configuration
+# ============================================================
+
+Write-Host "`n[1/5] Configuring mpv with Meson..." -ForegroundColor Cyan
 
 meson setup build-spatial `
     --wrap-mode=forcefallback `
@@ -280,7 +315,113 @@ meson setup build-spatial `
     -Drubberband=disabled `
     -Dwayland=disabled `
     -Dx11=disabled
-ninja -C build-spatial mpv.exe mpv.com libmpv.a
-cp ./build-spatial/subprojects/vulkan-loader/vulkan.dll ./build-spatial/vulkan-1.dll
-cp ./etc/mpv-*.bat ./build-spatial./build-spatial/mpv.com -v --no-config
 
+if ($LASTEXITCODE -ne 0) {
+    throw "Meson configuration failed!"
+}
+
+Write-Host "[OK] Meson configuration completed." -ForegroundColor Green
+
+# ============================================================
+# 8. Complete Ninja build
+# ============================================================
+
+Write-Host "`n[2/5] Building mpv.exe, mpv.com and libmpv.a..." -ForegroundColor Cyan
+
+ninja -C build-spatial mpv.exe mpv.com libmpv.a
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Ninja build failed!"
+}
+
+Write-Host "[OK] Ninja build completed." -ForegroundColor Green
+
+# ============================================================
+# 9. Vulkan DLL deployment
+# ============================================================
+
+Write-Host "`n[3/5] Deploying Vulkan Loader..." -ForegroundColor Cyan
+
+$VulkanDll = "./build-spatial/subprojects/vulkan-loader/vulkan.dll"
+$VulkanDestination = "./build-spatial/vulkan-1.dll"
+
+if (Test-Path $VulkanDll) {
+    Copy-Item $VulkanDll $VulkanDestination -Force
+    Write-Host "[OK] Vulkan DLL deployed." -ForegroundColor Green
+}
+elseif (Test-Path $VulkanDestination) {
+    Write-Host "[OK] Existing Vulkan DLL found." -ForegroundColor Green
+}
+else {
+    Write-Warning "Vulkan DLL not found. Check Vulkan Loader output and runtime dependencies."
+}
+
+# ============================================================
+# 10. Copy Windows batch files
+# ============================================================
+
+Write-Host "`n[4/5] Copying Windows batch files..." -ForegroundColor Cyan
+
+$BatchFiles = Get-ChildItem "./etc" -Filter "mpv-*.bat" -File
+
+if ($BatchFiles.Count -gt 0) {
+    Copy-Item $BatchFiles.FullName "./build-spatial/" -Force
+    Write-Host "[OK] Windows batch files copied." -ForegroundColor Green
+}
+else {
+    Write-Warning "No mpv batch files found."
+}
+
+# ============================================================
+# 11. Verify build artifacts
+# ============================================================
+
+Write-Host "`nChecking build artifacts..." -ForegroundColor Cyan
+
+$Targets = @(
+    "mpv.exe",
+    "mpv.com",
+    "libmpv.a"
+)
+
+foreach ($Target in $Targets) {
+    $Path = Join-Path "./build-spatial" $Target
+
+    if (!(Test-Path $Path)) {
+        throw "Missing build artifact: $Target"
+    }
+
+    Write-Host "[OK] $Target" -ForegroundColor Green
+}
+
+# ============================================================
+# 12. Runtime test
+# ============================================================
+
+Write-Host "`n[5/5] Running mpv runtime test..." -ForegroundColor Cyan
+
+& "./build-spatial/mpv.com" -v --no-config
+
+if ($LASTEXITCODE -ne 0) {
+    throw "mpv runtime test failed! Exit code: $LASTEXITCODE"
+}
+
+# ============================================================
+# 13. Build summary
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================" -ForegroundColor Green
+Write-Host " MPV BUILD SUCCESSFUL" -ForegroundColor Green
+Write-Host "============================================" -ForegroundColor Green
+
+Write-Host "[OK] Meson configuration"
+Write-Host "[OK] Ninja compilation"
+Write-Host "[OK] mpv.exe"
+Write-Host "[OK] mpv.com"
+Write-Host "[OK] libmpv.a"
+Write-Host "[OK] Runtime startup test"
+
+Write-Host ""
+Write-Host "Build directory: ./build-spatial" -ForegroundColor Cyan
+Write-Host "============================================"
