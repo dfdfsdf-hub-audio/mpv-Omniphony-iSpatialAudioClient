@@ -268,5 +268,5 @@ meson setup build-spatial `
     -Dx11=disabled
 ninja -C build-spatial mpv.exe mpv.com libmpv.a
 cp ./build-spatial/subprojects/vulkan-loader/vulkan.dll ./build-spatial/vulkan-1.dll
-cp ./etc/mpv-*.bat ./build
-./build-spatial/mpv.com -v --no-config
+cp ./etc/mpv-*.bat ./build-spatial./build-spatial/mpv.com -v --no-config
+
