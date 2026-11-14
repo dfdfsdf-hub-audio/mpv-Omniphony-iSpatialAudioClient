@@ -8,11 +8,11 @@
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * License along with mpv. If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdint.h>
@@ -20,10 +20,6 @@
 #include <stdatomic.h>
 #include <string.h>
 
-/*
- * Define the COM interface GUIDs from the Windows SDK headers in this
- * translation unit. This must precede headers that include guiddef.h.
- */
 #include <initguid.h>
 
 #include <audioclient.h>
@@ -32,12 +28,6 @@
 #include <windows.h>
 #include <spatialaudioclient.h>
 
-/*
- * spatialaudioclient.h declares these IIDs as external constants but does not
- * provide their definitions in the Windows SDK import libraries used by the
- * native Clang toolchain. Define the SDK interface GUIDs in this translation
- * unit so lld-link can resolve the COM activation and stream interface IDs.
- */
 DEFINE_GUID(IID_ISpatialAudioClient,
     0xbbf8e066, 0xaaaa, 0x49be, 0x9a, 0x4d,
     0xfd, 0x2a, 0x85, 0x8e, 0xa2, 0x7f);
@@ -96,19 +86,135 @@ struct priv {
     int num_objects;
 
     uint64_t submitted_frames;
+
+    /* Runtime diagnostics; updated only by the spatial render thread. */
+    UINT64 last_render_qpc;
+    UINT64 stats_last_report_qpc;
+    UINT64 render_period_total_qpc;
+    UINT64 render_period_max_qpc;
+    UINT64 render_time_total_qpc;
+    UINT64 render_time_max_qpc;
+
+    uint64_t render_events;
+    uint64_t render_timeouts;
+    uint64_t beginupdate_failures;
+    uint64_t getbuffer_failures;
+    uint64_t endupdate_failures;
+    uint64_t invalid_frame_counts;
+    uint64_t clock_getposition_failures;
+    uint64_t clock_fallbacks;
+    uint64_t clock_invalidations;
+
+    UINT32 last_frames;
+    UINT32 min_frames;
+    UINT32 max_observed_frames;
+
+    uint64_t slow_render_events;
+
+    /* Optional MMCSS registration. */
+    HMODULE avrt_module;
+    HANDLE mmcss_handle;
+    bool mmcss_registered;
 };
 
-/*
- * Reset all cached clock samples.
- *
- * This must be called whenever the stream playback timeline is stopped,
- * restarted or reset, so stale timestamps cannot leak into a new period.
- */
 static void reset_clock_sample(struct priv *p)
 {
     p->last_clock_position = 0;
     p->last_clock_qpc = 0;
     p->clock_sample_valid = false;
+}
+
+typedef HANDLE (WINAPI *av_set_mm_thread_characteristics_fn)(
+    LPCWSTR, LPDWORD);
+
+typedef BOOL (WINAPI *av_set_mm_thread_priority_fn)(
+    HANDLE, int);
+
+typedef BOOL (WINAPI *av_revert_mm_thread_characteristics_fn)(
+    HANDLE);
+
+static void register_mmcss(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+
+    p->avrt_module = LoadLibraryW(L"avrt.dll");
+
+    if (!p->avrt_module) {
+        MP_VERBOSE(ao,
+                   "MMCSS unavailable: avrt.dll could not be loaded.\n");
+        return;
+    }
+
+    av_set_mm_thread_characteristics_fn set_characteristics =
+        (av_set_mm_thread_characteristics_fn)GetProcAddress(
+            p->avrt_module, "AvSetMmThreadCharacteristicsW");
+
+    av_set_mm_thread_priority_fn set_priority =
+        (av_set_mm_thread_priority_fn)GetProcAddress(
+            p->avrt_module, "AvSetMmThreadPriority");
+
+    if (!set_characteristics) {
+        MP_VERBOSE(ao,
+                   "MMCSS unavailable: registration API not found.\n");
+        return;
+    }
+
+    DWORD task_index = 0;
+    bool pro_audio_task = true;
+
+    p->mmcss_handle =
+        set_characteristics(L"Pro Audio", &task_index);
+
+    if (!p->mmcss_handle) {
+        pro_audio_task = false;
+        p->mmcss_handle =
+            set_characteristics(L"Audio", &task_index);
+    }
+
+    if (!p->mmcss_handle) {
+        MP_VERBOSE(ao,
+                   "MMCSS registration failed: %lu.\n",
+                   GetLastError());
+        return;
+    }
+
+    p->mmcss_registered = true;
+
+    /* AVRT_PRIORITY_HIGH is 1. Avoid CRITICAL priority. */
+    if (set_priority &&
+        !set_priority(p->mmcss_handle, 1))
+    {
+        MP_VERBOSE(ao,
+                   "Setting MMCSS thread priority failed: %lu.\n",
+                   GetLastError());
+    }
+
+    MP_INFO(ao,
+            "Registered render thread with MMCSS (%s task).\n",
+            pro_audio_task ? "Pro Audio" : "Audio");
+}
+
+static void unregister_mmcss(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+
+    if (p->mmcss_handle && p->avrt_module) {
+        av_revert_mm_thread_characteristics_fn revert =
+            (av_revert_mm_thread_characteristics_fn)GetProcAddress(
+                p->avrt_module,
+                "AvRevertMmThreadCharacteristics");
+
+        if (revert)
+            revert(p->mmcss_handle);
+    }
+
+    p->mmcss_handle = NULL;
+    p->mmcss_registered = false;
+
+    if (p->avrt_module) {
+        FreeLibrary(p->avrt_module);
+        p->avrt_module = NULL;
+    }
 }
 
 static AudioObjectType speaker_to_object(int speaker)
@@ -160,13 +266,15 @@ static bool stop_stream(struct ao *ao)
         return true;
     }
 
-    HRESULT hr = ISpatialAudioObjectRenderStream_Stop(p->stream);
+    HRESULT hr =
+        ISpatialAudioObjectRenderStream_Stop(p->stream);
 
     p->started = false;
     reset_clock_sample(p);
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Stopping the spatial audio stream failed: %s\n",
+        MP_ERR(ao,
+               "Stopping the spatial audio stream failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
@@ -181,7 +289,8 @@ static bool reset_stream(struct ao *ao)
     if (!stop_stream(ao))
         return false;
 
-    HRESULT hr = ISpatialAudioObjectRenderStream_Reset(p->stream);
+    HRESULT hr =
+        ISpatialAudioObjectRenderStream_Reset(p->stream);
 
     release_objects(ao);
 
@@ -189,7 +298,8 @@ static bool reset_stream(struct ao *ao)
     reset_clock_sample(p);
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Resetting the spatial audio stream failed: %s\n",
+        MP_ERR(ao,
+               "Resetting the spatial audio stream failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
@@ -204,10 +314,12 @@ static bool start_stream(struct ao *ao)
     if (p->started)
         return true;
 
-    HRESULT hr = ISpatialAudioObjectRenderStream_Start(p->stream);
+    HRESULT hr =
+        ISpatialAudioObjectRenderStream_Start(p->stream);
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Starting the spatial audio stream failed: %s\n",
+        MP_ERR(ao,
+               "Starting the spatial audio stream failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
@@ -261,14 +373,16 @@ static void release_spatial(struct ao *ao)
 
 static bool is_float32_object_format(const WAVEFORMATEX *format)
 {
-    if (format->nChannels != 1 || format->wBitsPerSample != 32)
+    if (format->nChannels != 1 ||
+        format->wBitsPerSample != 32)
         return false;
 
     if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
         return true;
 
     if (format->wFormatTag != WAVE_FORMAT_EXTENSIBLE ||
-        format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
+        format->cbSize <
+            sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
         return false;
 
     static const GUID ieee_float_subtype = {
@@ -279,7 +393,8 @@ static bool is_float32_object_format(const WAVEFORMATEX *format)
     const WAVEFORMATEXTENSIBLE *ext =
         (const WAVEFORMATEXTENSIBLE *)format;
 
-    return memcmp(&ext->SubFormat, &ieee_float_subtype,
+    return memcmp(&ext->SubFormat,
+                  &ieee_float_subtype,
                   sizeof(ieee_float_subtype)) == 0;
 }
 
@@ -293,7 +408,8 @@ static bool select_object_format(struct ao *ao)
             p->client, &formats);
 
     if (FAILED(hr) || !formats) {
-        MP_ERR(ao, "Enumerating spatial audio formats failed: %s\n",
+        MP_ERR(ao,
+               "Enumerating spatial audio formats failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
@@ -305,7 +421,8 @@ static bool select_object_format(struct ao *ao)
         for (UINT32 n = 0; n < count; n++) {
             WAVEFORMATEX *format = NULL;
 
-            hr = IAudioFormatEnumerator_GetFormat(formats, n, &format);
+            hr = IAudioFormatEnumerator_GetFormat(
+                formats, n, &format);
 
             if (FAILED(hr))
                 break;
@@ -322,13 +439,15 @@ static bool select_object_format(struct ao *ao)
     IAudioFormatEnumerator_Release(formats);
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Reading a spatial audio format failed: %s\n",
+        MP_ERR(ao,
+               "Reading a spatial audio format failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
 
     if (!p->object_format) {
-        MP_ERR(ao, "No mono 32-bit float spatial audio format is available.\n");
+        MP_ERR(ao,
+               "No mono 32-bit float spatial audio format is available.\n");
         return false;
     }
 
@@ -348,7 +467,8 @@ static bool select_channel_layout(struct ao *ao)
     }
 
     if (!ao_chmap_sel_adjust(ao, &sel, &ao->channels)) {
-        MP_ERR(ao, "The spatial renderer can't represent the requested "
+        MP_ERR(ao,
+               "The spatial renderer can't represent the requested "
                "channel layout.\n");
         return false;
     }
@@ -361,7 +481,8 @@ static bool select_channel_layout(struct ao *ao)
             speaker_to_object(ao->channels.speaker[n]);
 
         if (!mask_has(p->native_mask, type)) {
-            MP_ERR(ao, "The spatial renderer doesn't expose speaker %d.\n",
+            MP_ERR(ao,
+                   "The spatial renderer doesn't expose speaker %d.\n",
                    ao->channels.speaker[n]);
             return false;
         }
@@ -385,7 +506,9 @@ static bool activate_spatial(struct ao *ao)
     if (!p->device_id)
         return false;
 
-    if (!wasapi_load_device(ao->log, &p->device, p->device_id))
+    if (!wasapi_load_device(ao->log,
+                            &p->device,
+                            p->device_id))
         return false;
 
     HRESULT hr = IMMDevice_Activate(
@@ -397,7 +520,8 @@ static bool activate_spatial(struct ao *ao)
     );
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Activating Windows Spatial Audio failed: %s\n",
+        MP_ERR(ao,
+               "Activating Windows Spatial Audio failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
@@ -406,11 +530,11 @@ static bool activate_spatial(struct ao *ao)
         return false;
 
     hr = ISpatialAudioClient_GetNativeStaticObjectTypeMask(
-        p->client, &p->native_mask
-    );
+        p->client, &p->native_mask);
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Querying static spatial audio objects failed: %s\n",
+        MP_ERR(ao,
+               "Querying static spatial audio objects failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
@@ -422,14 +546,23 @@ static bool activate_spatial(struct ao *ao)
     ao->format = AF_FORMAT_FLOATP;
 
     hr = ISpatialAudioClient_GetMaxFrameCount(
-        p->client, p->object_format, &p->max_frames
+        p->client,
+        p->object_format,
+        &p->max_frames
     );
 
     if (FAILED(hr) || p->max_frames == 0) {
-        MP_ERR(ao, "Querying the spatial audio buffer size failed: %s\n",
+        MP_ERR(ao,
+               "Querying the spatial audio buffer size failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
+
+    MP_INFO(ao,
+            "Spatial Audio buffer capacity: %u frames (%.3f ms at %u Hz).\n",
+            p->max_frames,
+            (double)p->max_frames * 1000.0 / ao->samplerate,
+            ao->samplerate);
 
     SpatialAudioObjectRenderStreamActivationParams params = {
         .ObjectFormat = p->object_format,
@@ -454,19 +587,21 @@ static bool activate_spatial(struct ao *ao)
     );
 
     if (FAILED(hr) || !p->stream) {
-        MP_ERR(ao, "Activating the spatial audio stream failed: %s\n",
+        MP_ERR(ao,
+               "Activating the spatial audio stream failed: %s\n",
                mp_HRESULT_to_str(hr));
         return false;
     }
 
     hr = ISpatialAudioObjectRenderStream_GetService(
-        p->stream, &IID_IAudioClock, (void **)&p->clock
+        p->stream,
+        &IID_IAudioClock,
+        (void **)&p->clock
     );
 
     if (SUCCEEDED(hr) && p->clock) {
         hr = IAudioClock_GetFrequency(
-            p->clock, &p->clock_frequency
-        );
+            p->clock, &p->clock_frequency);
 
         if (FAILED(hr) || p->clock_frequency == 0) {
             IAudioClock_Release(p->clock);
@@ -487,7 +622,10 @@ static bool activate_spatial(struct ao *ao)
 
     reset_clock_sample(p);
 
-    if (p->clock && p->clock_frequency && p->qpc_frequency) {
+    if (p->clock &&
+        p->clock_frequency &&
+        p->qpc_frequency)
+    {
         MP_DBG(ao,
                "IAudioClock enabled: frequency=%llu, QPC frequency=%llu.\n",
                (unsigned long long)p->clock_frequency,
@@ -498,7 +636,8 @@ static bool activate_spatial(struct ao *ao)
                    "output-time estimation.\n");
     }
 
-    MP_INFO(ao, "Using Windows Spatial Audio: %s at %d Hz "
+    MP_INFO(ao,
+            "Using Windows Spatial Audio: %s at %d Hz "
             "(%d static objects).\n",
             mp_chmap_to_str(&ao->channels),
             ao->samplerate,
@@ -507,11 +646,6 @@ static bool activate_spatial(struct ao *ao)
     return true;
 }
 
-/*
- * Convert QueryPerformanceCounter to 100-nanosecond units.
- *
- * IAudioClock::GetPosition returns its QPC timestamp in 100-ns units.
- */
 static bool get_qpc_time_100ns(struct priv *p, UINT64 *time)
 {
     LARGE_INTEGER counter;
@@ -519,9 +653,7 @@ static bool get_qpc_time_100ns(struct priv *p, UINT64 *time)
     if (!p->qpc_frequency ||
         !QueryPerformanceCounter(&counter) ||
         counter.QuadPart < 0)
-    {
         return false;
-    }
 
     *time = (UINT64)av_rescale(
         counter.QuadPart,
@@ -532,12 +664,6 @@ static bool get_qpc_time_100ns(struct priv *p, UINT64 *time)
     return true;
 }
 
-/*
- * Estimate the number of frames already played.
- *
- * The audio device clock provides the primary position.
- * QPC compensates for the time elapsed after the device clock sample.
- */
 static double estimate_played_frames(
     struct ao *ao,
     UINT64 position,
@@ -558,10 +684,6 @@ static double estimate_played_frames(
     {
         UINT64 elapsed_100ns = now_qpc - qpc_position;
 
-        /*
-         * Ignore implausible timestamps.
-         * A sample older than 10 seconds is not trusted for extrapolation.
-         */
         if (elapsed_100ns < 10ULL * 10000000ULL) {
             played +=
                 (double)elapsed_100ns *
@@ -572,18 +694,6 @@ static double estimate_played_frames(
     return played;
 }
 
-/*
- * Estimate the output presentation time.
- *
- * Normal path:
- *   IAudioClock position + QPC correction.
- *
- * Temporary clock failure:
- *   Reuse the last valid sample and extrapolate with QPC.
- *
- * No valid sample:
- *   Fall back to a conservative two-buffer estimate.
- */
 static int64_t estimate_output_time(struct ao *ao, UINT32 frames)
 {
     struct priv *p = ao->priv;
@@ -601,6 +711,11 @@ static int64_t estimate_output_time(struct ao *ao, UINT32 frames)
         );
 
         bool have_sample = SUCCEEDED(hr);
+
+        if (!have_sample) {
+            p->clock_getposition_failures++;
+            p->clock_fallbacks++;
+        }
 
         if (have_sample) {
             p->last_clock_position = position;
@@ -623,6 +738,7 @@ static int64_t estimate_output_time(struct ao *ao, UINT32 frames)
                     now_qpc - qpc_position >= 10ULL * 10000000ULL)
                 {
                     reset_clock_sample(p);
+                    p->clock_invalidations++;
                 } else {
                     have_sample = true;
                 }
@@ -637,10 +753,6 @@ static int64_t estimate_output_time(struct ao *ao, UINT32 frames)
                 p->qpc_frequency != 0
             );
 
-            /*
-             * Never estimate that more frames have played than
-             * this stream has actually submitted.
-             */
             if (played > (double)p->submitted_frames)
                 played = (double)p->submitted_frames;
 
@@ -649,19 +761,10 @@ static int64_t estimate_output_time(struct ao *ao, UINT32 frames)
                     (double)p->submitted_frames - played;
             }
         } else {
-            /*
-             * No valid audio clock sample is currently available.
-             *
-             * queued_frames already contains the current buffer.
-             * Add one more buffer as a conservative fallback.
-             */
             queued_frames += frames;
         }
     } else {
-        /*
-         * IAudioClock unavailable:
-         * retain the conservative two-buffer estimate.
-         */
+        p->clock_fallbacks++;
         queued_frames += frames;
     }
 
@@ -672,9 +775,124 @@ static int64_t estimate_output_time(struct ao *ao, UINT32 frames)
         );
 }
 
+static bool get_qpc_counter(UINT64 *value)
+{
+    LARGE_INTEGER counter;
+
+    if (!QueryPerformanceCounter(&counter) ||
+        counter.QuadPart < 0)
+        return false;
+
+    *value = (UINT64)counter.QuadPart;
+    return true;
+}
+
+static double qpc_ticks_to_ms(struct priv *p, UINT64 ticks)
+{
+    if (!p->qpc_frequency)
+        return 0.0;
+
+    return (double)ticks * 1000.0 /
+           (double)p->qpc_frequency;
+}
+
+static void report_spatial_stats(struct ao *ao, bool force)
+{
+    struct priv *p = ao->priv;
+    UINT64 now = 0;
+
+    if (!p->qpc_frequency ||
+        !get_qpc_counter(&now))
+        return;
+
+    if (!p->stats_last_report_qpc) {
+        p->stats_last_report_qpc = now;
+
+        if (!force)
+            return;
+    }
+
+    if (!force &&
+        (now < p->stats_last_report_qpc ||
+         now - p->stats_last_report_qpc <
+             p->qpc_frequency * 5))
+        return;
+
+    p->stats_last_report_qpc = now;
+
+    double avg_period_ms = 0.0;
+    double avg_processing_ms = 0.0;
+
+    if (p->render_events > 1) {
+        avg_period_ms = qpc_ticks_to_ms(
+            p,
+            p->render_period_total_qpc /
+                (p->render_events - 1));
+    }
+
+    if (p->render_events > 0) {
+        avg_processing_ms = qpc_ticks_to_ms(
+            p,
+            p->render_time_total_qpc /
+                p->render_events);
+    }
+
+    MP_VERBOSE(ao,
+        "WASAPI Spatial diagnostics:\n"
+        "  Buffer frames: capacity=%u, last=%u, min=%u, max=%u\n"
+        "  Render: events=%llu, period avg/max=%.3f/%.3f ms, "
+        "processing avg/max=%.3f/%.3f ms\n"
+        "  Failures: timeouts=%llu, Begin=%llu, GetBuffer=%llu, "
+        "EndUpdate=%llu, invalid-frames=%llu\n"
+        "  Audio clock: GetPosition failures=%llu, fallbacks=%llu, "
+        "invalidations=%llu\n"
+        "  Scheduling: MMCSS=%s, slow-render-events=%llu\n",
+        p->max_frames,
+        p->last_frames,
+        p->min_frames == UINT32_MAX ? 0 : p->min_frames,
+        p->max_observed_frames,
+        (unsigned long long)p->render_events,
+        avg_period_ms,
+        qpc_ticks_to_ms(p, p->render_period_max_qpc),
+        avg_processing_ms,
+        qpc_ticks_to_ms(p, p->render_time_max_qpc),
+        (unsigned long long)p->render_timeouts,
+        (unsigned long long)p->beginupdate_failures,
+        (unsigned long long)p->getbuffer_failures,
+        (unsigned long long)p->endupdate_failures,
+        (unsigned long long)p->invalid_frame_counts,
+        (unsigned long long)p->clock_getposition_failures,
+        (unsigned long long)p->clock_fallbacks,
+        (unsigned long long)p->clock_invalidations,
+        p->mmcss_registered ? "active" : "unavailable",
+        (unsigned long long)p->slow_render_events);
+}
+
 static bool feed_spatial(struct ao *ao)
 {
     struct priv *p = ao->priv;
+
+    UINT64 render_start_qpc = 0;
+    UINT64 render_end_qpc = 0;
+
+    bool have_render_start =
+        get_qpc_counter(&render_start_qpc);
+
+    if (have_render_start) {
+        if (p->last_render_qpc &&
+            render_start_qpc >= p->last_render_qpc)
+        {
+            UINT64 period =
+                render_start_qpc - p->last_render_qpc;
+
+            p->render_period_total_qpc += period;
+
+            if (period > p->render_period_max_qpc)
+                p->render_period_max_qpc = period;
+        }
+
+        p->last_render_qpc = render_start_qpc;
+    }
 
     UINT32 available_dynamic = 0;
     UINT32 frames = 0;
@@ -687,16 +905,34 @@ static bool feed_spatial(struct ao *ao)
         );
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Starting a spatial audio update failed: %s\n",
+        p->beginupdate_failures++;
+
+        MP_ERR(ao,
+               "Starting a spatial audio update failed: %s\n",
                mp_HRESULT_to_str(hr));
+
+        report_spatial_stats(ao, false);
         return false;
     }
 
     (void)available_dynamic;
 
+    p->last_frames = frames;
+
+    if (frames > 0 && frames <= p->max_frames) {
+        if (frames < p->min_frames)
+            p->min_frames = frames;
+
+        if (frames > p->max_observed_frames)
+            p->max_observed_frames = frames;
+    } else {
+        p->invalid_frame_counts++;
+    }
+
     void *planes[MP_NUM_CHANNELS] = {0};
 
-    bool valid = frames > 0 && frames <= p->max_frames;
+    bool valid =
+        frames > 0 && frames <= p->max_frames;
 
     for (int n = 0; valid && n < p->num_objects; n++) {
         if (!p->objects[n].object) {
@@ -707,9 +943,14 @@ static bool feed_spatial(struct ao *ao)
                     &p->objects[n].object
                 );
 
-            if (FAILED(hr) || !p->objects[n].object) {
-                MP_ERR(ao, "Activating spatial object %d failed: %s\n",
-                       n, mp_HRESULT_to_str(hr));
+            if (FAILED(hr) ||
+                !p->objects[n].object)
+            {
+                MP_ERR(ao,
+                       "Activating spatial object %d failed: %s\n",
+                       n,
+                       mp_HRESULT_to_str(hr));
+
                 valid = false;
                 break;
             }
@@ -728,8 +969,13 @@ static bool feed_spatial(struct ao *ao)
             !buffer ||
             bytes < frames * sizeof(float))
         {
-            MP_ERR(ao, "Getting the buffer for spatial object %d failed: %s\n",
-                   n, mp_HRESULT_to_str(hr));
+            p->getbuffer_failures++;
+
+            MP_ERR(ao,
+                   "Getting the buffer for spatial object %d failed: %s\n",
+                   n,
+                   mp_HRESULT_to_str(hr));
+
             valid = false;
             break;
         }
@@ -737,7 +983,7 @@ static bool feed_spatial(struct ao *ao)
         planes[n] = buffer;
     }
 
-    bool eof = 0;
+    bool eof = false;
 
     if (valid) {
         ao_read_data(
@@ -752,16 +998,55 @@ static bool feed_spatial(struct ao *ao)
     }
 
     hr =
-        ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(p->stream);
+        ISpatialAudioObjectRenderStream_EndUpdatingAudioObjects(
+            p->stream
+        );
 
     if (FAILED(hr)) {
-        MP_ERR(ao, "Finishing a spatial audio update failed: %s\n",
+        p->endupdate_failures++;
+
+        MP_ERR(ao,
+               "Finishing a spatial audio update failed: %s\n",
                mp_HRESULT_to_str(hr));
+
         valid = false;
     }
 
     if (valid)
         p->submitted_frames += frames;
+
+    if (have_render_start &&
+        get_qpc_counter(&render_end_qpc) &&
+        render_end_qpc >= render_start_qpc)
+    {
+        UINT64 duration =
+            render_end_qpc - render_start_qpc;
+
+        p->render_time_total_qpc += duration;
+
+        if (duration > p->render_time_max_qpc)
+            p->render_time_max_qpc = duration;
+
+        p->render_events++;
+
+        /*
+         * Flag work consuming at least 80% of this callback's
+         * audio period. This is diagnostic, not proof of underrun.
+         */
+        if (ao->samplerate > 0 &&
+            frames > 0 &&
+            p->qpc_frequency > 0)
+        {
+            double budget_ticks =
+                (double)frames * p->qpc_frequency /
+                (double)ao->samplerate;
+
+            if ((double)duration >= budget_ticks * 0.80)
+                p->slow_render_events++;
+        }
+    }
+
+    report_spatial_stats(ao, false);
 
     if (eof)
         ao_stop_streaming(ao);
@@ -778,11 +1063,10 @@ static bool process_requests(struct ao *ao)
 
     if (atomic_exchange(&p->reset_requested, false) &&
         !reset_stream(ao))
-    {
         return false;
-    }
 
-    bool should_run = atomic_load(&p->running_requested);
+    bool should_run =
+        atomic_load(&p->running_requested);
 
     if (should_run && !p->started)
         return start_stream(ao);
@@ -800,9 +1084,13 @@ static MP_THREAD_VOID spatial_thread(void *ctx)
 
     mp_thread_set_name("ao/wasapi-spatial");
 
-    HRESULT co_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    register_mmcss(ao);
 
-    p->init_ok = SUCCEEDED(co_hr) && activate_spatial(ao);
+    HRESULT co_hr =
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    p->init_ok =
+        SUCCEEDED(co_hr) && activate_spatial(ao);
 
     SetEvent(p->init_done);
 
@@ -817,7 +1105,8 @@ static MP_THREAD_VOID spatial_thread(void *ctx)
     };
 
     while (true) {
-        DWORD timeout = p->started ? 100 : INFINITE;
+        DWORD timeout =
+            p->started ? 100 : INFINITE;
 
         DWORD result = WaitForMultipleObjects(
             MP_ARRAY_SIZE(waits),
@@ -841,6 +1130,8 @@ static MP_THREAD_VOID spatial_thread(void *ctx)
             }
 
         } else if (result == WAIT_TIMEOUT) {
+            p->render_timeouts++;
+
             if (++render_timeouts >= 10) {
                 MP_WARN(ao,
                         "The spatial audio render event stopped. "
@@ -861,7 +1152,10 @@ static MP_THREAD_VOID spatial_thread(void *ctx)
     }
 
 done:
+    report_spatial_stats(ao, true);
+
     release_spatial(ao);
+    unregister_mmcss(ao);
 
     if (SUCCEEDED(co_hr))
         CoUninitialize();
@@ -918,15 +1212,21 @@ static int init(struct ao *ao)
         return -1;
     }
 
-    p->init_done = CreateEventW(NULL, false, false, NULL);
-    p->command_event = CreateEventW(NULL, false, false, NULL);
-    p->render_event = CreateEventW(NULL, false, false, NULL);
+    p->init_done =
+        CreateEventW(NULL, false, false, NULL);
+
+    p->command_event =
+        CreateEventW(NULL, false, false, NULL);
+
+    p->render_event =
+        CreateEventW(NULL, false, false, NULL);
 
     if (!p->init_done ||
         !p->command_event ||
         !p->render_event)
     {
-        MP_ERR(ao, "Creating spatial audio events failed.\n");
+        MP_ERR(ao,
+               "Creating spatial audio events failed.\n");
 
         uninit(ao);
         return -1;
@@ -938,14 +1238,48 @@ static int init(struct ao *ao)
 
     reset_clock_sample(p);
 
-    if (mp_thread_create(&p->thread, spatial_thread, ao)) {
-        MP_ERR(ao, "Creating the spatial audio thread failed.\n");
+    p->last_render_qpc = 0;
+    p->stats_last_report_qpc = 0;
+
+    p->render_period_total_qpc = 0;
+    p->render_period_max_qpc = 0;
+    p->render_time_total_qpc = 0;
+    p->render_time_max_qpc = 0;
+
+    p->render_events = 0;
+    p->render_timeouts = 0;
+    p->beginupdate_failures = 0;
+    p->getbuffer_failures = 0;
+    p->endupdate_failures = 0;
+    p->invalid_frame_counts = 0;
+
+    p->clock_getposition_failures = 0;
+    p->clock_fallbacks = 0;
+    p->clock_invalidations = 0;
+
+    p->last_frames = 0;
+    p->min_frames = UINT32_MAX;
+    p->max_observed_frames = 0;
+
+    p->slow_render_events = 0;
+
+    p->avrt_module = NULL;
+    p->mmcss_handle = NULL;
+    p->mmcss_registered = false;
+
+    if (mp_thread_create(&p->thread,
+                         spatial_thread,
+                         ao))
+    {
+        MP_ERR(ao,
+               "Creating the spatial audio thread failed.\n");
 
         uninit(ao);
         return -1;
     }
 
-    DWORD result = WaitForSingleObject(p->init_done, 15000);
+    DWORD result =
+        WaitForSingleObject(p->init_done, 15000);
 
     if (result != WAIT_OBJECT_0 || !p->init_ok) {
         if (result == WAIT_TIMEOUT) {
