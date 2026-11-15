@@ -1,222 +1,423 @@
 ![mpv logo](https://raw.githubusercontent.com/mpv-player/mpv.io/master/source/images/mpv-logo-128.png)
+# mpv Omniphony iSpatialAudioClient
 
-# mpv
+**A custom Windows Spatial Audio output backend for mpv, powered by Microsoft's `ISpatialAudioClient` API.**
 
+[![Windows Spatial Audio Build](https://github.com/dfdfsdf-hub-audio/mpv-Omniphony-iSpatialAudioClient/actions/workflows/build-wasapi-spatial.yml/badge.svg)](https://github.com/dfdfsdf-hub-audio/mpv-Omniphony-iSpatialAudioClient/actions)
 
-* [External links](#external-links)
-* [Overview](#overview)
-* [System requirements](#system-requirements)
-* [Downloads](#downloads)
-* [Changelog](#changelog)
-* [Compilation](#compilation)
-* [Release cycle](#release-cycle)
-* [Bug reports](#bug-reports)
-* [Contributing](#contributing)
-* [License](#license)
-* [Contact](#contact)
+`mpv-Omniphony-iSpatialAudioClient` is a customized version of [mpv](https://github.com/mpv-player/mpv) that introduces a dedicated Windows WASAPI Spatial Audio output backend.
 
+The project aims to provide a direct multichannel PCM output path through Microsoft's Windows Spatial Audio API, enabling compatible Windows spatial audio processing pipelines to receive multichannel audio from mpv.
 
-## External links
+The project is designed to work alongside external audio rendering software such as **Omniphony Studio**, allowing rendered multichannel audio to be passed into the Windows Spatial Audio pipeline.
 
+---
 
-* [Wiki](https://github.com/mpv-player/mpv/wiki)
-* [User Scripts](https://github.com/mpv-player/mpv/wiki/User-Scripts)
-* [FAQ][FAQ]
-* [Manual](https://mpv.io/manual/master/)
+## Contents
 
+- [Project Overview](#project-overview)
+- [Key Features](#key-features)
+- [Audio Architecture](#audio-architecture)
+- [Supported Platforms](#supported-platforms)
+- [Building](#building)
+- [Windows Spatial Audio Output](#windows-spatial-audio-output)
+- [Omniphony Studio Integration](#omniphony-studio-integration)
+- [Configuration Example](#configuration-example)
+- [Build Status](#build-status)
+- [Limitations](#limitations)
+- [Development](#development)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
 
-## Overview
+---
 
+## Project Overview
 
-**mpv** is a free (as in freedom) media player for the command line. It supports
-a wide variety of media file formats, audio and video codecs, and subtitle types.
+The standard mpv audio output architecture provides several audio output backends, including WASAPI on Windows.
 
-There is a [FAQ][FAQ].
+This project extends that architecture with a dedicated output backend:
 
-Releases can be found on the [release list][releases].
+```text
+ao=wasapi-spatial
+```
 
-## System requirements
+Unlike conventional WASAPI shared-mode output, the custom backend is designed around the Windows Spatial Audio API:
 
-- A not too ancient Linux (usually, only the latest releases of distributions
-  are actively supported), Windows 10 1607 or later, or macOS 10.15 or later.
-- A somewhat capable CPU. Hardware decoding might help if the CPU is too slow to
-  decode video in realtime, but must be explicitly enabled with the `--hwdec`
-  option.
-- A not too crappy GPU. mpv's focus is not on power-efficient playback on
-  embedded or integrated GPUs (for example, hardware decoding is not even
-  enabled by default). Low power GPUs may cause issues like tearing, stutter,
-  etc. On such GPUs, it's recommended to use `--profile=fast` for smooth playback.
-  The main video output uses shaders for video rendering and scaling,
-  rather than GPU fixed function hardware. On Windows, you might want to make
-  sure the graphics drivers are current. In some cases, ancient fallback video
-  output methods can help (such as `--vo=xv` on Linux), but this use is not
-  recommended or supported.
+```text
+ISpatialAudioClient
+ISpatialAudioObjectRenderStream
+ISpatialAudioObject
+```
 
-mpv does not go out of its way to break on older hardware or old, unsupported
-operating systems, but development is not done with them in mind. Keeping
-compatibility with such setups is not guaranteed. If things work, consider it
-a happy accident.
+The implementation uses Windows event-driven spatial audio rendering to submit audio through spatial audio objects.
 
-## Downloads
+The main objective is to provide a multichannel PCM output backend that can participate in a Windows Spatial Audio processing chain.
 
+## Key Features
 
-For semi-official builds and third-party packages please see
-[mpv.io/installation](https://mpv.io/installation/).
+### Windows Spatial Audio API
 
-## Changelog
+- Dedicated `wasapi-spatial` audio output backend.
+- Uses Microsoft's `ISpatialAudioClient` interface.
+- Event-driven rendering architecture.
+- Spatial audio object buffer management.
+- Multichannel PCM submission through spatial audio objects.
 
+### Audio Rendering and Scheduling
 
-There is no complete changelog; however, changes to the player core interface
-are listed in the [interface changelog][interface-changes].
+- MMCSS audio thread scheduling.
+- Attempts to register the rendering thread with the Windows Pro Audio task profile, with an Audio task fallback.
+- High-priority rendering thread scheduling.
+- QPC-based rendering timing measurements.
+- Render-time diagnostics and slow-render event monitoring.
+- Audio clock integration where supported, with fallback timing estimation.
 
-Changes to the C API are documented in the [client API changelog][api-changes].
+### mpv Integration
 
-The [release list][releases] has a summary of most of the important changes
-on every release.
+- Integrated into mpv's audio output subsystem.
+- Retains mpv's existing decoding and audio processing pipeline.
+- Supports mpv's existing media formats and decoders, subject to the capabilities of the selected build.
+- Designed to work with externally rendered multichannel PCM.
 
-Changes to the default key bindings are indicated in
-[restore-old-bindings.conf][restore-old-bindings].
+---
 
-Changes to the default OSC bindings are indicated in
-[restore-osc-bindings.conf][restore-osc-bindings].
+## Audio Architecture
 
-## Compilation
+The intended audio processing chain is:
 
+```text
+                 Media Sources
+                       |
+                       v
+                mpv Demuxer
+                       |
+                       v
+                Audio Decoder
+                       |
+                       v
+             mpv Audio Processing
+                       |
+                       v
+              Multichannel PCM
+                       |
+                       v
+              ao=wasapi-spatial
+                       |
+                       v
+             Windows Spatial Audio
+                ISpatialAudioClient
+                       |
+                       v
+           Windows Spatial Audio Pipeline
+                       |
+                       v
+             Compatible Spatial Audio
+                  Endpoint / Engine
+```
 
-Compiling with full features requires development files for several
-external libraries. Mpv requires [meson](https://mesonbuild.com/index.html)
-to build. Meson can be obtained from your distro or PyPI.
+For an external rendering workflow:
 
-After creating your build directory (e.g. `meson setup build`), you can view a list
-of all the build options via `meson configure build`. You could also just simply
-look at the `meson_options.txt` file. Logs are stored in `meson-logs` within
-your build directory.
+```text
+        Dolby Atmos / Multichannel Sources
+                       |
+                       v
+              Omniphony Studio
+                       |
+                       v
+            Multichannel PCM Rendering
+                       |
+                       v
+                  mpv Input
+                       |
+                       v
+              WASAPI Spatial Backend
+                       |
+                       v
+             Windows Spatial Audio
+```
 
-Example:
+**Important:** This project provides a Windows Spatial Audio output backend. It does not independently decode Dolby Atmos bitstreams or replace an Atmos renderer. Atmos decoding and rendering depend on the upstream decoder or external rendering software used in the audio workflow.
 
-    meson setup build
-    meson compile -C build
-    meson install -C build
+---
 
-For libplacebo, meson can use a git check out as a subproject for a convenient
-way to compile mpv if a sufficient libplacebo version is not easily available
-in the build environment. It will be statically linked with mpv. Example:
+## Supported Platforms
 
-    mkdir -p subprojects
-    git clone https://code.videolan.org/videolan/libplacebo.git --depth=1 --recursive subprojects/libplacebo
+### Windows
 
-Essential dependencies (incomplete list):
+The primary development and testing target is:
 
-- gcc or clang
-- X development headers (xlib, xrandr, xext, xscrnsaver, xpresent, libvdpau,
-  libGL, GLX, EGL, xv, ...)
-- Audio output development headers (libasound/ALSA, pulseaudio)
-- FFmpeg libraries (libavutil libavcodec libavformat libswscale libavfilter
-  and either libswresample or libavresample)
-- libplacebo
-- zlib
-- iconv (normally provided by the system libc)
-- libass (OSD, OSC, text subtitles)
-- Lua (optional, required for the OSC pseudo-GUI and youtube-dl integration)
-- libjpeg (optional, used for screenshots only)
-- uchardet (optional, for subtitle charset detection)
-- nvdec and vaapi libraries for hardware decoding on Linux (optional)
+- Windows 10 version 1607 or later.
+- Windows 11.
+- Windows Spatial Audio-compatible audio endpoints and processing environments.
 
-Libass dependencies (when building libass):
+The backend requires Windows Spatial Audio API support and a compatible spatial audio configuration.
 
-- gcc or clang, nasm on x86 and x86_64
-- fribidi, freetype, fontconfig development headers (for libass)
-- harfbuzz (required for correct rendering of combining characters, particularly
-  for correct rendering of non-English text on macOS, and Arabic/Indic scripts on
-  any platform)
+Linux and macOS are not targets of the custom `wasapi-spatial` backend. Other mpv functionality remains subject to the original project's platform support.
 
-FFmpeg dependencies (when building FFmpeg):
+---
 
-- gcc or clang, nasm on x86 and x86_64
-- OpenSSL or GnuTLS (have to be explicitly enabled when compiling FFmpeg)
-- libx264/libmp3lame/libfdk-aac if you want to use encoding (have to be
-  explicitly enabled when compiling FFmpeg)
-- For native DASH playback, FFmpeg needs to be built with --enable-libxml2
-  (although there are security implications, and DASH support has lots of bugs).
-- AV1 decoding support requires dav1d.
-- For good nvidia support on Linux, make sure nv-codec-headers is installed
-  and can be found by configure.
+## Building
 
-Most of the above libraries are available in suitable versions on normal
-Linux distributions. For ease of compiling the latest git master of everything,
-you may wish to use the separately available build wrapper ([mpv-build][mpv-build])
-which first compiles FFmpeg libraries and libass, and then compiles the player
-statically linked against those.
+This project uses the Meson build system and Ninja.
 
-If you want to build a Windows binary, see [Windows compilation][windows_compilation].
+The Windows CI build script is:
 
+```text
+ci/build-win32-spatial.ps1
+```
 
-## Release cycle
+### Build prerequisites
 
-Once or twice a year, a release is cut off from the current development state
-and is assigned a 0.X.0 version number. No further maintenance is done, except
-in the event of security issues.
+- Windows 10 or Windows 11.
+- Git.
+- Python.
+- Meson.
+- Ninja.
+- A supported C compiler toolchain.
+- Windows SDK.
+- The dependencies required by mpv and its enabled subprojects.
 
-The goal of releases is to make Linux distributions happy. Linux distributions
-are also expected to apply their own patches in case of bugs.
+### Build using the project script
 
-Releases other than the latest release are unsupported and unmaintained.
+From a suitable PowerShell environment:
 
-See the [release policy document][release-policy] for more information.
+```powershell
+git clone https://github.com/dfdfsdf-hub-audio/mpv-Omniphony-iSpatialAudioClient.git
 
-## Bug reports
+cd mpv-Omniphony-iSpatialAudioClient
 
+powershell -ExecutionPolicy Bypass -File .\ci\build-win32-spatial.ps1
+```
 
-Please use the [issue tracker][issue-tracker] provided by GitHub to send us bug
-reports or feature requests. Follow the template's instructions or the issue
-will likely be ignored or closed as invalid.
+The project build configuration enables the relevant Windows components, including:
 
-Questions can be asked in the [discussions][discussions] or on IRC (see
-[Contact](#Contact) below).
+```text
+-Dwasapi=enabled
+-Dorender=enabled
+-Dd3d11=enabled
+-Dvulkan=enabled
+```
 
-## Contributing
+The build script also builds the mpv executables and libmpv library, performs a basic executable smoke test, and prepares build artifacts.
 
+### Manual Meson build
 
-Please read [contribute.md][contribute.md].
+A basic Meson build can be configured with:
 
-For small changes you can just send us pull requests through GitHub. For bigger
-changes come and talk to us on IRC before you start working on them. It will
-make code review easier for both parties later on.
+```powershell
+meson setup build-spatial `
+    --wrap-mode=forcefallback `
+    -Ddefault_library=static `
+    -Dlibmpv=true `
+    -Dtests=true `
+    -Dgpl=true `
+    -Dwasapi=enabled `
+    -Dorender=enabled
 
-You can check [the wiki](https://github.com/mpv-player/mpv/wiki/Stuff-to-do)
-or the [issue tracker](https://github.com/mpv-player/mpv/issues?q=is%3Aopen+is%3Aissue+label%3Ameta%3Afeature-request)
-for ideas on what you could contribute with.
+ninja -C build-spatial
+```
+
+For a performance-oriented Release build, use a separate build directory:
+
+```powershell
+meson setup build-spatial-release `
+    --buildtype=release `
+    --optimization=3 `
+    --wrap-mode=forcefallback `
+    -Ddefault_library=static `
+    -Dlibmpv=true `
+    -Dtests=true `
+    -Dgpl=true `
+    -Dwasapi=enabled `
+    -Dorender=enabled
+
+ninja -C build-spatial-release
+```
+
+The manual commands above are illustrative configurations. For the complete project-specific dependency and feature configuration, refer to `ci/build-win32-spatial.ps1`.
+
+---
+
+## Windows Spatial Audio Output
+
+The custom audio output driver is:
+
+```ini
+ao=wasapi-spatial
+```
+
+It uses Windows Spatial Audio interfaces to manage the rendering stream and submit audio buffers.
+
+The rendering process includes:
+
+1. Initializing the Spatial Audio client.
+2. Creating the spatial audio render stream.
+3. Waiting for rendering events.
+4. Beginning an audio update cycle.
+5. Obtaining buffers for spatial audio objects.
+6. Filling the buffers with audio data.
+7. Ending the update cycle to submit the rendered audio.
+
+The backend also collects timing information to help investigate scheduling and rendering performance.
+
+### Rendering diagnostics
+
+The implementation includes diagnostic information such as:
+
+- Maximum available frame count.
+- Actual frame count per rendering update.
+- Rendering period.
+- Rendering duration.
+- Slow rendering events.
+- Rendering wait timeouts.
+- Audio buffer acquisition and submission failures.
+- Audio clock failures and fallback usage.
+
+These measurements are intended to help identify rendering problems. They should not automatically be interpreted as proof of audible dropouts or hardware output latency.
+
+---
+
+## Omniphony Studio Integration
+
+This project is intended to complement external multichannel audio rendering software, including Omniphony Studio.
+
+A typical workflow is:
+
+```text
+Source Audio
+     |
+     v
+Omniphony Studio
+     |
+     v
+Multichannel PCM
+     |
+     v
+mpv
+     |
+     v
+WASAPI Spatial Audio Backend
+     |
+     v
+Windows Spatial Audio
+```
+
+For example, a rendered 7.1.4 PCM signal can be supplied to mpv, with the intended channel layout explicitly configured.
+
+The actual channel mapping, spatial object assignment, endpoint compatibility, and final playback behavior must be verified on the target Windows system.
+
+This project focuses on the output transport and rendering integration rather than performing the Atmos object rendering itself.
+
+---
+
+## Configuration Example
+
+A basic mpv configuration:
+
+```ini
+# Windows Spatial Audio output
+ao=wasapi-spatial
+
+# Example: 7.1.4 channel layout
+audio-channels=fl-fr-fc-lfe-bl-br-sl-sr-tfl-tfr-tbl-tbr
+
+# Keep the source channel layout explicit when required
+```
+
+The example above describes a 12-channel 7.1.4 speaker layout.
+
+Channel ordering must match the actual input PCM channel order and the backend's spatial object mapping. Do not assume that every external renderer uses the same ordering.
+
+For other layouts, configure `audio-channels` to match the actual PCM channel arrangement.
+
+---
+
+## Build Status
+
+The project has successfully completed a Windows x64 CI build.
+
+The verified build pipeline includes:
+
+- Windows x64 compilation.
+- WASAPI Spatial Audio backend compilation.
+- Meson test execution.
+- Build artifact generation and upload.
+- Basic executable smoke testing.
+
+Latest known successful build:
+
+- Commit: `0c9b479a0b44ac7acdb7c9a6cf7a1979a4c5dc88`
+- Branch: `feature/wasapi-spatial-audio-orender`
+- Workflow run: [GitHub Actions #43596002227](https://github.com/dfdfsdf-hub-audio/mpv-Omniphony-iSpatialAudioClient/actions/runs/43596002227)
+
+A successful CI build confirms that the tested source revision compiles and passes the configured tests. It does not, by itself, establish successful real-device playback, correct channel mapping, or the absence of audio dropouts.
+
+---
+
+## Limitations
+
+This project is under active development.
+
+The following areas require validation on real Windows hardware:
+
+- Actual Windows Spatial Audio endpoint compatibility.
+- Full multichannel playback stability.
+- 7.1.4 channel mapping accuracy.
+- Side and rear channel separation.
+- Spatial audio object positioning.
+- Rendering latency and scheduling behavior.
+- Long-duration playback reliability.
+- Compatibility with different Windows Spatial Audio processing modes.
+
+The project should be considered an experimental custom mpv audio output implementation until these areas have been comprehensively validated.
+
+---
+
+## Development
+
+The main custom audio output implementation is located at:
+
+```text
+audio/out/ao_wasapi_spatial.c
+```
+
+The Windows build script is located at:
+
+```text
+ci/build-win32-spatial.ps1
+```
+
+The project is based on mpv and follows its existing build architecture and audio output subsystem design.
+
+Contributions, bug reports, and technical discussions are welcome through the repository's GitHub issue tracker.
+
+- [Issues](https://github.com/dfdfsdf-hub-audio/mpv-Omniphony-iSpatialAudioClient/issues)
+- [Pull Requests](https://github.com/dfdfsdf-hub-audio/mpv-Omniphony-iSpatialAudioClient/pulls)
+- [Actions](https://github.com/dfdfsdf-hub-audio/mpv-Omniphony-iSpatialAudioClient/actions)
+
+---
+
+## Acknowledgements
+
+This project is built upon the work of the original mpv project and the wider open-source multimedia ecosystem.
+
+Special thanks to:
+
+- [mpv](https://github.com/mpv-player/mpv)
+- [FFmpeg](https://ffmpeg.org/)
+- [Microsoft Windows Spatial Audio API](https://learn.microsoft.com/en-us/windows/win32/api/spatialaudioclient/)
+- The developers and contributors of the open-source multimedia libraries used by mpv.
+
+---
 
 ## License
 
-GPLv2 "or later" by default, LGPLv2.1 "or later" with `-Dgpl=false`.
-See [details.](https://github.com/mpv-player/mpv/blob/master/Copyright)
+This project is based on mpv.
 
-## History
+The original mpv licensing terms apply:
 
-This software is based on the MPlayer project. Before mpv existed as a project,
-the code base was briefly developed under the mplayer2 project. For details,
-see the [FAQ][FAQ].
+- GPLv2 or later by default.
+- LGPLv2.1 or later when built with `-Dgpl=false`.
 
-## Contact
+See the original [mpv Copyright file](https://github.com/mpv-player/mpv/blob/master/Copyright) and the individual component licenses for details.
 
-
-Most activity happens on the IRC channel and the GitHub issue tracker.
-
-- **GitHub issue tracker**: [issue tracker][issue-tracker] (report bugs here)
-- **Discussions**: [discussions][discussions]
-- **User IRC Channel**: `#mpv` on `irc.libera.chat`
-- **Developer IRC Channel**: `#mpv-devel` on `irc.libera.chat`
-
-[FAQ]: https://github.com/mpv-player/mpv/wiki/FAQ
-[releases]: https://github.com/mpv-player/mpv/releases
-[mpv-build]: https://github.com/mpv-player/mpv-build
-[issue-tracker]:  https://github.com/mpv-player/mpv/issues
-[discussions]: https://github.com/mpv-player/mpv/discussions
-[release-policy]: https://github.com/mpv-player/mpv/blob/master/DOCS/release-policy.md
-[windows_compilation]: https://github.com/mpv-player/mpv/blob/master/DOCS/compile-windows.md
-[interface-changes]: https://github.com/mpv-player/mpv/blob/master/DOCS/interface-changes.rst
-[api-changes]: https://github.com/mpv-player/mpv/blob/master/DOCS/client-api-changes.rst
-[restore-old-bindings]: https://github.com/mpv-player/mpv/blob/master/etc/restore-old-bindings.conf
-[restore-osc-bindings]: https://github.com/mpv-player/mpv/blob/master/etc/restore-osc-bindings.conf
-[contribute.md]: https://github.com/mpv-player/mpv/blob/master/DOCS/contribute.md
