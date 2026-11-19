@@ -403,11 +403,10 @@ This project is built upon the work of the original mpv project and the wider op
 
 Special thanks to:
 
-- ChatGPT-6
+- ChatGPT-6 for AI-assisted development, technical discussions, debugging, and documentation.
 - [mpv](https://github.com/mpv-player/mpv)
 - [FFmpeg](https://ffmpeg.org/)
 - [Microsoft Windows Spatial Audio API](https://learn.microsoft.com/en-us/windows/win32/api/spatialaudioclient/)
-  
 - The developers and contributors of the open-source multimedia libraries used by mpv.
 
 ---
